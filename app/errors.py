@@ -59,3 +59,13 @@ def unit_conflict(message, field, details=None):
 
 def missing_declaration(message, field, details=None):
     return APIError("MISSING_DECLARATION", message, field, details, 422)
+
+
+def invalid_path(message, field, details=None):
+    """试算调整路径失效：下标越界、注解与实际成分不符、无法下钻。"""
+    return APIError("INVALID_PATH", message, field, details, 422)
+
+
+def empty_recipe(message, field, details=None):
+    """调整（remove）使配方或其某层子配方出现不再含任何成分。"""
+    return APIError("EMPTY_RECIPE", message, field, details, 422)

@@ -5,6 +5,7 @@ import json
 from flask import Blueprint, jsonify, request
 
 from . import engine
+from . import scenario
 from .db import get_conn, row_to_dict, utc_now_iso
 from .errors import APIError, conflict
 from .units import UnitGraph
@@ -13,6 +14,7 @@ from .validation import (
     validate_ingredients,
     validate_recipe,
     validate_rules,
+    validate_scenario_compare,
     validate_units,
 )
 
@@ -449,6 +451,63 @@ def export_computation(comp_id):
             from .errors import not_found
             raise not_found(f"计算记录 {comp_id} 不存在", "computation_id")
         return jsonify(json.loads(row["export_doc"]))
+    finally:
+        conn.close()
+
+
+# ---- 试算比较（不落库）-------------------------------------------------------
+
+@bp.post("/scenarios/compare")
+def scenario_compare():
+    """临时换料试算：对基准配方应用调整项，分别推导基准与候选标签并比较。
+
+    全程只读：不写 recipe / computation 表，不累计命中次数，
+    也不影响正式计算的指纹缓存。
+    """
+    req = validate_scenario_compare(_json_body())
+    conn = get_conn()
+    try:
+        ingredient_pack = engine.load_ingredient_release(
+            conn, req["ingredient_release"])
+        unit_pack = engine.load_unit_version(conn, req["unit_version"])
+        rules_pack = engine.load_rules(conn, req["rule_version"])
+
+        # 基准：与正式计算完全同口径（纯读取）
+        _, leaves_b, _, closure_b, meta_b = engine.expand_tree(
+            conn, unit_pack, ingredient_pack,
+            req["recipe_code"], req["recipe_version"],
+        )
+        engine.check_declarations(leaves_b, rules_pack)
+        agg_b = engine.aggregate(leaves_b, meta_b["root"],
+                                 req["servings_override"], rules_pack, meta_b)
+        fingerprint_b, _ = engine.build_fingerprint(
+            req, req["recipe_code"], req["recipe_version"], agg_b["servings"],
+            closure_b, ingredient_pack, unit_pack, rules_pack,
+        )
+
+        # 应用调整（内存副本；路径失效/替换引用不存在在此报 4xx）
+        overrides, matched, effective = scenario.apply_adjustments(
+            conn, ingredient_pack, req["recipe_code"], req["recipe_version"],
+            req["adjustments"],
+        )
+
+        # 候选：同口径展开 + 声明校验；失败归因到 adjustments[i]
+        try:
+            _, leaves_c, _, _, meta_c = engine.expand_tree(
+                conn, unit_pack, ingredient_pack,
+                req["recipe_code"], req["recipe_version"],
+                recipe_overrides=overrides,
+            )
+            engine.check_declarations(leaves_c, rules_pack)
+        except APIError as err:
+            raise scenario.remap_error(err, matched) from err
+        agg_c = engine.aggregate(leaves_c, meta_c["root"],
+                                 req["servings_override"], rules_pack, meta_c)
+
+        return jsonify(scenario.build_compare_response(
+            req, ingredient_pack, unit_pack, rules_pack, meta_b["root"],
+            closure_b, fingerprint_b, effective, matched, agg_b, agg_c,
+        )), 200
     finally:
         conn.close()
 

@@ -5,6 +5,7 @@
 """
 
 import numbers
+import re
 
 from .errors import malformed
 from .common import content_hash
@@ -302,3 +303,99 @@ def validate_compute(req):
         "rule_version": rule_version,
         "servings_override": float(servings_override) if servings_override else None,
     }
+
+
+# ---- 试算比较（scenarios/compare）--------------------------------------------
+
+VALID_OPS = ("set_qty", "replace", "remove")
+
+_PATH_SEG_RE = re.compile(
+    r"\[(\d+)\](?:\((ingredient|recipe):([^@()]+)@([^()]+)\))?"
+)
+
+
+def parse_component_path(raw, field):
+    """把嵌套组件路径解析为 [{index, kind, code, version}, ...]。
+
+    支持三种写法（与计算结果/错误中的字段路径同格式）：
+      - 规范注解串 ``components[1](recipe:SAUCE@1)[0](ingredient:TOMATO@1)``
+      - 简写下标串 ``components[1][0]``
+      - 下标数组 ``[1, 0]``
+    注解（kind/code@version）在应用调整时会与实际成分逐一核对，不符即路径失效。
+    """
+    if isinstance(raw, list):
+        segments = []
+        for v in raw:
+            if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+                raise malformed("路径数组元素必须是非负整数", field)
+            segments.append({"index": v, "kind": None, "code": None,
+                             "version": None})
+        return segments
+    if not isinstance(raw, str) or not raw.startswith("components"):
+        raise malformed("路径必须以 components 开头（或为非负整数数组）", field)
+    rest = raw[len("components"):]
+    segments = []
+    while rest:
+        m = _PATH_SEG_RE.match(rest)
+        if not m:
+            raise malformed(f"路径片段无法解析：{rest!r}", field)
+        segments.append({"index": int(m.group(1)), "kind": m.group(2),
+                         "code": m.group(3), "version": m.group(4)})
+        rest = rest[m.end():]
+    return segments
+
+
+def validate_scenario_compare(req):
+    """试算请求：基准配方 + 锁定版本（同计算请求）+ 调整项数组。"""
+    req = _require_body(req)
+    base = validate_compute(req)
+    items = _require(req, "adjustments", "", "list")
+    if not items:
+        raise malformed("adjustments 至少包含一项", "adjustments")
+
+    adjustments = []
+    for i, a in enumerate(items):
+        p = f"adjustments[{i}]"
+        if not isinstance(a, dict):
+            raise malformed("调整项必须是对象", p)
+        op = _require(a, "op", p, "str")
+        if op not in VALID_OPS:
+            raise malformed(f"op 必须是 {VALID_OPS} 之一", f"{p}.op")
+        segments = parse_component_path(_require(a, "path", p), f"{p}.path")
+        if not segments:
+            raise malformed("路径必须至少定位一个成分", f"{p}.path")
+        adj = {"op": op, "segments": segments}
+        if op == "set_qty":
+            adj["qty"] = float(_require(a, "qty", p, "pos"))
+            unit = a.get("unit")
+            if unit is not None:
+                if not _is_nonempty_str(unit):
+                    raise malformed("unit 必须是非空字符串", f"{p}.unit")
+                adj["unit"] = unit
+        elif op == "replace":
+            spec = _require(a, "component", p, "dict")
+            kind = _require(spec, "kind", f"{p}.component", "str")
+            if kind not in VALID_KINDS:
+                raise malformed(f"kind 必须是 {VALID_KINDS} 之一",
+                                f"{p}.component.kind")
+            code = _require(spec, "code", f"{p}.component", "str")
+            version = spec.get("version", "1")
+            if not _is_nonempty_str(version):
+                raise malformed("component.version 必须是非空字符串（缺省为 '1'）",
+                                f"{p}.component.version")
+            qty = spec.get("qty")
+            if qty is not None and (not _is_num(qty) or qty <= 0):
+                raise malformed("component.qty 必须是正数（缺省继承被替换成分）",
+                                f"{p}.component.qty")
+            unit = spec.get("unit")
+            if unit is not None and not _is_nonempty_str(unit):
+                raise malformed("component.unit 必须是非空字符串（缺省继承被替换成分）",
+                                f"{p}.component.unit")
+            adj["component"] = {
+                "kind": kind, "code": code, "version": version,
+                "qty": float(qty) if qty is not None else None,
+                "unit": unit,
+            }
+        adjustments.append(adj)
+
+    return {**base, "adjustments": adjustments}

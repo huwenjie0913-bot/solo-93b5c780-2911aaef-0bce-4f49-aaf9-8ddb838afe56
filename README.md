@@ -9,7 +9,9 @@
 - **资料版本不可变 + 计算时版本锁定**，历史计算永远可复算；
 - 以**请求指纹**复用完全等价的计算；
 - 可**按配方追溯**其作为根配方或子配方参与过的全部计算；
-- 可导出**含完整计算依据**（缩放边界、单位换算路径、基准因子、锁定版本哈希）的 JSON。
+- 可导出**含完整计算依据**（缩放边界、单位换算路径、基准因子、锁定版本哈希）的 JSON；
+- 可**试算临时换料方案**（`set_qty`/`replace`/`remove`，按嵌套组件路径定位），
+  与基准并排比较营养、占比、过敏原差异，全程不落库。
 
 技术栈：Python 3.11、Flask、sqlite3（标准库）、pytest。
 
@@ -19,7 +21,7 @@
 pip install -r requirements.txt
 export LABEL_DB_PATH=./labels.db     # 可选，默认 ./labels.db
 python run.py                        # http://localhost:5000
-pytest -q                            # 16 个端到端测试
+pytest -q                            # 39 个端到端测试
 ```
 
 ## 数据模型与版本语义
@@ -106,6 +108,57 @@ curl -X POST localhost:5000/api/computations -H 'Content-Type: application/json'
 components[1](recipe:SAUCE@1)[0](ingredient:TOMATO@1)
 ```
 
+## 试算比较（POST /api/scenarios/compare）
+
+临时换料还没到发布新配方版本的阶段时，用试算先把影响算清。
+输入基准配方与锁定的原料/单位/规则版本（同 `POST /api/computations`），
+外加一组 `adjustments`；接口沿用递归展开与声明校验分别推导基准与候选，
+并排返回差异。**全程只读**：不写 `recipe`/`computation` 表、不累计命中次数、
+不影响正式计算的指纹缓存（`persisted: false`）。
+
+```json
+{
+  "recipe_code": "MEAL", "recipe_version": "1",
+  "ingredient_release": "ing-1", "unit_version": "u-1", "rule_version": "r-1",
+  "adjustments": [
+    {"op": "set_qty",
+     "path": "components[1](recipe:SAUCE@1)[0](ingredient:TOMATO@1)",
+     "qty": 300},
+    {"op": "replace", "path": "components[0](ingredient:PASTA@1)",
+     "component": {"kind": "ingredient", "code": "NUT_PESTO",
+                   "qty": 0.8, "unit": "kg"}},
+    {"op": "remove",
+     "path": "components[1](recipe:SAUCE@1)[1](ingredient:BASIL@1)"}
+  ]
+}
+```
+
+- **路径**：与计算结果/错误中的字段路径同格式，三种写法等价——
+  规范注解串 `components[1](recipe:SAUCE@1)[0](ingredient:TOMATO@1)`、
+  简写下标串 `components[1][0]`、下标数组 `[1, 0]`。
+  注解（kind/code@version）会与实际成分逐一核对，不符即 `INVALID_PATH`。
+- **op**：
+  - `set_qty`：改成分用量（`qty` 必填正数，`unit` 可选，缺省保持原单位）；
+  - `replace`：整体替换成分（`component.kind/code` 必填，`version` 缺省 `"1"`，
+    `qty`/`unit` 缺省**继承**被替换成分）；
+  - `remove`：移除成分。
+- **顺序生效**：调整按提交顺序应用，后一条的路径基于前面调整后的状态解析
+  （`remove` 会使同层后续成分下标前移）；同一子配方被引用多次时，
+  路径调整只作用于被命中的那次出现。
+- **响应**：`baseline_fingerprint`（基准请求指纹，与正式计算同口径）、
+  `candidate_hash`（候选内容哈希）、`matched_paths`（每条调整实际命中的
+  规范组件路径）、`baseline`/`candidate` 两侧完整结果，以及 `diff`——
+  每份营养与 NRV% 差值、原料占比变化（`added/removed/changed/unchanged`）、
+  过敏原变化（`added/removed/escalated/de-escalated/unchanged`）。
+
+试算特有的 4xx（字段定位到 `adjustments[i]`，候选展开期的单位/声明错误
+也会归因到引发它的那条调整，`details.component_path` 保留原始组件路径）：
+
+| HTTP | code | 触发场景 |
+|---|---|---|
+| 422 | `INVALID_PATH` | 调整路径失效：下标越界、注解与实际成分不符、下钻原料成分 |
+| 422 | `EMPTY_RECIPE` | `remove` 使配方（或某层子配方出现）不再含任何成分 |
+
 ## 错误模型（4xx，均带字段路径）
 
 ```json
@@ -124,6 +177,8 @@ components[1](recipe:SAUCE@1)[0](ingredient:TOMATO@1)
 | 422 | `UNKNOWN_INGREDIENT` / `UNKNOWN_RECIPE` | 引用了锁定资料中不存在的原料/配方版本 |
 | 422 | `UNIT_CONFLICT` | 未知单位、引用单位无法换算到子配方产量单位、出现量无法换算到原料基准单位或根配方产量单位（如质量 g 与体积 ml 之间无换算） |
 | 422 | `MISSING_DECLARATION` | 规则要求的营养素/过敏原在某个叶子原料上未声明 |
+| 422 | `INVALID_PATH` | 试算调整路径失效：下标越界、注解与实际成分不符、下钻原料成分（field 定位 `adjustments[i].path`） |
+| 422 | `EMPTY_RECIPE` | 试算 `remove` 使配方（或某层子配方出现）不再含任何成分（field 定位 `adjustments[i]`） |
 
 字段路径按引用链拼装，例如
 `components[1](recipe:SAUCE@1)[0](ingredient:TOMATO@1).allergens.milk`，
@@ -139,6 +194,7 @@ POST   /api/rules                       提交标签规则版本     GET  /api/r
 POST   /api/recipes                     提交配方版本         GET  /api/recipes?code=
 GET    /api/recipes/<code>/<version>    查看配方版本
 POST   /api/computations                推导（指纹命中返回 200，否则 201）
+POST   /api/scenarios/compare           临时换料试算比较（只读不落库）
 GET    /api/computations/<id>           取回计算摘要
 GET    /api/computations/fingerprint/<fp>   指纹反查记录
 GET    /api/computations/<id>/export    导出含计算依据的完整 JSON
@@ -159,6 +215,7 @@ app/
   units.py       单位换算图 + 闭包一致性 + BFS 换算路径
   validation.py  载荷形状校验
   engine.py      递归展开、营养/占比/过敏原推导、指纹、导出文档
+  scenario.py    试算比较：按路径调整、基准/候选并排推导、差异汇总（不落库）
   api.py         Flask 路由
   app_factory.py 应用工厂与错误序列化
 tests/test_api.py 16 个端到端测试

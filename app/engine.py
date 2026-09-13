@@ -79,14 +79,19 @@ def _seg(i, comp):
     return f"[{i}]({comp['kind']}:{comp['code']}@{comp['version']})"
 
 
-def expand_tree(conn, unit_pack, ingredient_pack, root_code, root_version):
+def expand_tree(conn, unit_pack, ingredient_pack, root_code, root_version,
+                recipe_overrides=None):
     """深度优先展开配方树。
 
-    返回 (tree, leaves, boundaries, recipe_closure)：
+    返回 (tree, leaves, boundaries, recipe_closure, meta)：
       - tree：可导出的成分树（含逐层缩放系数与换算审计路径）
       - leaves：每个原料出现一次的平铺项（含营养贡献）
       - boundaries：跨配方边界的缩放记录（计算依据）
       - recipe_closure：[(code, version, body_hash, depth)]，根配方 depth=0
+
+    recipe_overrides（试算专用）：{成分下标路径元组: 配方行字典}，
+    如 {(1,): 修改后的 SAUCE 副本}。命中时以覆盖内容展开该次出现而不查库；
+    同一 (code, version) 在其他位置的出现不受影响。
     """
     recipes_cache = {}
     closure = {}
@@ -94,7 +99,9 @@ def expand_tree(conn, unit_pack, ingredient_pack, root_code, root_version):
     boundaries = []
     conversions_used = []
 
-    def get_recipe(code, version):
+    def get_recipe(code, version, idx_path):
+        if recipe_overrides is not None and idx_path in recipe_overrides:
+            return recipe_overrides[idx_path]
         key = (code, version)
         if key not in recipes_cache:
             row = load_recipe(conn, code, version)
@@ -104,7 +111,7 @@ def expand_tree(conn, unit_pack, ingredient_pack, root_code, root_version):
             recipes_cache[key] = row
         return recipes_cache[key]
 
-    root = get_recipe(root_code, root_version)
+    root = get_recipe(root_code, root_version, ())
     if root is None:
         raise not_found(
             f"配方 {root_code}@{root_version} 不存在",
@@ -115,7 +122,8 @@ def expand_tree(conn, unit_pack, ingredient_pack, root_code, root_version):
     graph = unit_pack["graph"]
     ingredients = ingredient_pack["ingredients"]
 
-    def dfs(code, version, ref_qty, ref_unit, chain, stack, depth, is_root):
+    def dfs(code, version, ref_qty, ref_unit, chain, stack, depth, is_root,
+            idx_path):
         key = (code, version)
         stack_keys = set(stack)
         if key in stack_keys:
@@ -125,14 +133,14 @@ def expand_tree(conn, unit_pack, ingredient_pack, root_code, root_version):
                 f"配方存在循环引用：{' -> '.join(cyc)}",
                 {"cycle": cyc, "field": "components" + chain + ".code"},
             )
-        recipe = get_recipe(code, version)
+        recipe = get_recipe(code, version, idx_path)
         if recipe is None:
             raise unknown_recipe(
                 f"未知配方引用 {code}@{version}",
                 "components" + chain + ".code",
                 {"code": code, "version": version},
             )
-        closure[key] = depth
+        closure[(code, version, idx_path)] = (depth, recipe)
 
         # 引用数量先换算到配方产量单位，再除以产量得到缩放系数
         if is_root:
@@ -183,7 +191,7 @@ def expand_tree(conn, unit_pack, ingredient_pack, root_code, root_version):
             if comp["kind"] == "recipe":
                 child = dfs(
                     comp["code"], comp["version"], eff_qty, comp["unit"],
-                    chain + seg, stack, depth + 1, False,
+                    chain + seg, stack, depth + 1, False, idx_path + (i,),
                 )
                 node["children"].append(child)
             else:
@@ -240,12 +248,26 @@ def expand_tree(conn, unit_pack, ingredient_pack, root_code, root_version):
         return node
 
     tree = dfs(root_code, root_version, root["yield_qty"], root["yield_unit"],
-               "", [], 0, True)
-    closure_rows = [
-        {"code": c, "version": v, "body_hash": recipes_cache[(c, v)]["body_hash"],
-         "depth": d}
-        for (c, v), d in sorted(closure.items(), key=lambda kv: (kv[1], kv[0]))
-    ]
+               "", [], 0, True, ())
+    if recipe_overrides is None:
+        # 正式计算：同一 (code, version) 内容唯一，按配方去重（保持既有口径）
+        collapsed = {}
+        for (c, v, _p), (d, row) in closure.items():
+            collapsed[(c, v)] = (d, row)
+        closure_rows = [
+            {"code": c, "version": v, "body_hash": row["body_hash"], "depth": d}
+            for (c, v), (d, row) in sorted(collapsed.items(),
+                                           key=lambda kv: (kv[1][0], kv[0]))
+        ]
+    else:
+        # 试算：同一配方的不同出现可能内容不同（被覆盖），按出现路径逐条列出
+        closure_rows = [
+            {"code": c, "version": v, "body_hash": row["body_hash"], "depth": d,
+             "occurrence": list(p)}
+            for (c, v, p), (d, row) in sorted(
+                closure.items(),
+                key=lambda kv: (kv[1][0], kv[0][2], kv[0][0], kv[0][1]))
+        ]
     meta = {
         "root": root,
         "conversions_used": _dedupe_conversions(conversions_used),
