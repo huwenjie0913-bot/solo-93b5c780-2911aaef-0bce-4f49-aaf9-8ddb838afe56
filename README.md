@@ -144,7 +144,8 @@ components[1](recipe:SAUCE@1)[0](ingredient:TOMATO@1)
   - `remove`：移除成分。
 - **顺序生效**：调整按提交顺序应用，后一条的路径基于前面调整后的状态解析
   （`remove` 会使同层后续成分下标前移）；同一子配方被引用多次时，
-  路径调整只作用于被命中的那次出现。
+  路径调整只作用于被命中的那次出现。父级 `replace`/`remove` 会废弃
+  该路径下此前调整保存的子级覆盖，候选仅按替换/移除后的组件树计算。
 - **响应**：`baseline_fingerprint`（基准请求指纹，与正式计算同口径）、
   `candidate_hash`（候选内容哈希）、`matched_paths`（每条调整实际命中的
   规范组件路径）、`baseline`/`candidate` 两侧完整结果，以及 `diff`——

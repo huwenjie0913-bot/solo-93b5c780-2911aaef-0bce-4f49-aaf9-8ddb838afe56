@@ -28,6 +28,18 @@ def _recipe_body_hash(row):
     })
 
 
+def _discard_subtree_overrides(overrides, target_idx_path):
+    """丢弃目标路径及其下游的全部覆盖。
+
+    父级 replace/remove 使整个目标子树失效：此前为该子树保存的覆盖
+    （如先改了 SAUCE 内的 TOMATO）必须一并废弃，否则候选展开会在该
+    出现位置命中过期副本，子级修改静默残留。
+    """
+    n = len(target_idx_path)
+    for key in [k for k in overrides if k[:n] == target_idx_path]:
+        del overrides[key]
+
+
 def apply_adjustments(conn, ingredient_pack, root_code, root_version, adjustments):
     """按顺序应用调整，返回 (overrides, matched, effective)。
 
@@ -115,8 +127,13 @@ def apply_adjustments(conn, ingredient_pack, root_code, root_version, adjustment
 
         target_parent = overrides[parent_idx]
         t_idx = segs[-1]["index"]
+        target_idx_path = parent_idx + (t_idx,)
         comp = target_parent["components"][t_idx]
         op = adj["op"]
+        if op in ("replace", "remove"):
+            # 父级替换/移除使目标子树整体失效：废弃该路径下此前保存的
+            # 子级覆盖，候选仅按替换/移除后的组件树计算
+            _discard_subtree_overrides(overrides, target_idx_path)
         if op == "set_qty":
             comp["qty"] = adj["qty"]
             if adj.get("unit") is not None:
@@ -167,7 +184,7 @@ def apply_adjustments(conn, ingredient_pack, root_code, root_version, adjustment
             "index": i,
             "op": op,
             "path": canonical,
-            "idx_path": parent_idx + (t_idx,),
+            "idx_path": target_idx_path,
         })
 
     return overrides, matched, effective

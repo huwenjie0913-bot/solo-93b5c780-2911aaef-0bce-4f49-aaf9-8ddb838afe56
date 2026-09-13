@@ -310,6 +310,100 @@ def test_servings_override_applies_to_both_sides(client):
     assert energy["delta"]["per_serving"] == -175
 
 
+# ---- 父子路径重叠：后执行的父级调整废弃子级覆盖 ---------------------------------
+
+PESTO_SAUCE = {"code": "PESTO_SAUCE", "version": "1",
+               "yield": {"qty": 1000, "unit": "g"}, "servings": 10,
+               "components": [{"kind": "ingredient", "code": "NUT_PESTO",
+                               "qty": 500, "unit": "g"}]}
+
+
+def test_parent_replace_discards_child_override(client):
+    """先改 SAUCE 内的 TOMATO，再把父组件 SAUCE 整体 replace 为 PESTO_SAUCE：
+    父级替换废弃该路径下此前保存的子级覆盖，候选仅按替换后的组件树计算。"""
+    seed(client)
+    assert client.post("/api/recipes", json=PESTO_SAUCE).status_code == 201
+    before = _db_counts()
+    resp = client.post("/api/scenarios/compare", json={**BASE_REQ, "adjustments": [
+        {"op": "set_qty", "path": TOMATO_IN_SAUCE, "qty": 300},
+        {"op": "replace", "path": "components[1](recipe:SAUCE@1)",
+         "component": {"kind": "recipe", "code": "PESTO_SAUCE",
+                       "version": "1"}},
+    ]})
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    assert [m["op"] for m in body["matched_paths"]] == ["set_qty", "replace"]
+
+    # 候选只含 PASTA 与 NUT_PESTO：TOMATO/BASIL 随 SAUCE 一起被替换掉
+    cand_codes = {a["code"]
+                  for a in body["candidate"]["ingredients_aggregate"]}
+    assert cand_codes == {"PASTA", "NUT_PESTO"}
+
+    props = {d["code"]: d for d in body["diff"]["ingredients"]}
+    assert props["TOMATO"]["change"] == "removed"
+    assert props["BASIL"]["change"] == "removed"
+    assert props["NUT_PESTO"]["change"] == "added"
+    # 继承原引用量 10 portion = 1000g → 缩放 1.0 → NUT_PESTO 500g
+    assert props["NUT_PESTO"]["candidate"]["root_unit_qty"] == 500
+    assert props["PASTA"]["change"] == "unchanged"
+
+    allergens = {d["allergen"]: d for d in body["diff"]["allergens"]}
+    assert allergens["tree_nut"]["change"] == "added"
+    assert allergens["milk"]["change"] == "added"
+    assert allergens["gluten"]["change"] == "unchanged"  # PASTA 未动
+
+    # 营养按替换后的组件树计算：PASTA 800g + NUT_PESTO 500g
+    energy = {d["nutrient"]: d
+              for d in body["diff"]["nutrition"]}["energy_kcal"]
+    assert energy["candidate"]["per_serving"] == 1200  # (2800+2000)/4
+    assert energy["delta"]["per_serving"] == 469       # 1200 - 730.575
+
+    # 零持久化保持不变
+    assert _db_counts() == before
+
+
+def test_parent_remove_discards_child_override(client):
+    """先改子级再移除父级：remove 同样废弃该路径下的子级覆盖。"""
+    seed(client)
+    resp = client.post("/api/scenarios/compare", json={**BASE_REQ, "adjustments": [
+        {"op": "set_qty", "path": TOMATO_IN_SAUCE, "qty": 300},
+        {"op": "remove", "path": "components[1](recipe:SAUCE@1)"},
+    ]})
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    cand_codes = {a["code"]
+                  for a in body["candidate"]["ingredients_aggregate"]}
+    assert cand_codes == {"PASTA"}
+    props = {d["code"]: d for d in body["diff"]["ingredients"]}
+    assert props["TOMATO"]["change"] == "removed"
+    assert props["BASIL"]["change"] == "removed"
+    assert props["PASTA"]["change"] == "unchanged"
+
+
+def test_replace_then_adjust_child_of_replacement(client):
+    """先替换父级再改新子树内的成分：后续子级调整作用于替换后的配方。"""
+    seed(client)
+    assert client.post("/api/recipes", json=PESTO_SAUCE).status_code == 201
+    resp = client.post("/api/scenarios/compare", json={**BASE_REQ, "adjustments": [
+        {"op": "replace", "path": "components[1](recipe:SAUCE@1)",
+         "component": {"kind": "recipe", "code": "PESTO_SAUCE",
+                       "version": "1"}},
+        {"op": "set_qty",
+         "path": "components[1](recipe:PESTO_SAUCE@1)"
+                 "[0](ingredient:NUT_PESTO@1)",
+         "qty": 250},
+    ]})
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    cand_codes = {a["code"]
+                  for a in body["candidate"]["ingredients_aggregate"]}
+    assert cand_codes == {"PASTA", "NUT_PESTO"}
+    props = {d["code"]: d for d in body["diff"]["ingredients"]}
+    assert props["NUT_PESTO"]["candidate"]["root_unit_qty"] == 250
+    assert props["TOMATO"]["change"] == "removed"
+    assert props["BASIL"]["change"] == "removed"
+
+
 # ---- 4xx：路径与引用 -----------------------------------------------------------
 
 def test_invalid_path_errors(client):
