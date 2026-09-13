@@ -335,6 +335,141 @@ def test_unit_conflict_basis_unreachable(client):
     assert err["details"]["reason"] == "no_path"
 
 
+def _volume_units():
+    # 质量链 kg<->g 与体积链 l<->ml 各自连通、互不可达
+    return {"version": "u-vol",
+            "conversions": [
+                {"from_unit": "kg", "to_unit": "g", "factor": 1000},
+                {"from_unit": "l", "to_unit": "ml", "factor": 1000},
+            ]}
+
+
+def test_volume_meal_basis_ok_but_root_unit_unreachable(client, tmp_path):
+    # VOLUME_MEAL 以 ml 计产量：TOMATO 用量 g 可换算到营养基准 g，
+    # 却无法换算到根产量单位 ml → 必须 4xx 并指出实际字段路径
+    client.post("/api/ingredients", json=INGREDIENTS)
+    assert client.post("/api/units", json=_volume_units()).status_code == 201
+    client.post("/api/rules", json=RULES)
+
+    volume_meal = {
+        "code": "VOLUME_MEAL", "version": "1", "name": "容量餐",
+        "yield": {"qty": 1000, "unit": "ml"}, "servings": 4,
+        "components": [
+            {"kind": "ingredient", "code": "TOMATO", "qty": 200, "unit": "g"},
+        ],
+    }
+    assert client.post("/api/recipes", json=volume_meal).status_code == 201
+
+    compute_req = {"recipe_code": "VOLUME_MEAL", "recipe_version": "1",
+                   "ingredient_release": "ing-1", "unit_version": "u-vol",
+                   "rule_version": "r-1"}
+
+    # 先成功计算一个正常配方，确认失败请求不会污染计算记录
+    client.post("/api/recipes", json=SAUCE)
+    ok = client.post("/api/computations", json={
+        "recipe_code": "SAUCE", "ingredient_release": "ing-1",
+        "unit_version": "u-vol", "rule_version": "r-1"})
+    assert ok.status_code == 201
+
+    resp = client.post("/api/computations", json=compute_req)
+    assert resp.status_code == 422
+    err = resp.get_json()["error"]
+    assert err["code"] == "UNIT_CONFLICT"
+    assert err["field"] == "components[0](ingredient:TOMATO@1).unit"
+    assert err["details"]["reason"] == "no_path"
+    assert err["details"]["from_unit"] == "g"
+    assert err["details"]["to_unit"] == "ml"
+
+    # 没有写入任何 VOLUME_MEAL 计算记录，正常记录也未被追加
+    hist_bad = client.get("/api/recipes/VOLUME_MEAL/1/history").get_json()
+    assert hist_bad == []
+    hist_sauce = client.get("/api/recipes/SAUCE/1/history").get_json()
+    assert len(hist_sauce) == 1
+
+    # 响应中绝不出现 null 占比
+    assert "proportion_pct" not in resp.get_data(as_text=True)
+
+    # 修正根产量单位为质量单位后，同配方内容可正常计算（占比非空）
+    fixed = dict(volume_meal, version="2")
+    fixed["yield"] = {"qty": 1000, "unit": "g"}
+    client.post("/api/recipes", json=fixed)
+    resp2 = client.post("/api/computations", json={
+        **compute_req, "recipe_version": "2"})
+    assert resp2.status_code == 201
+    tomato = next(i for i in resp2.get_json()["ingredients_aggregate"]
+                  if i["code"] == "TOMATO")
+    assert tomato["proportion_pct"] == 20.0
+    assert tomato["root_unit_qty"] == 200
+
+
+def test_volume_meal_nested_basis_ok_but_root_unit_unreachable(client):
+    # 嵌套情形：子配方以 ml 计产量、原料按 g 使用（g→g 营养基准可达），
+    # 根 VOLUME_MEAL 也是 ml；叶子在换算根产量单位时 g→ml 失败，
+    # 错误路径必须带完整引用链且不落记录
+    client.post("/api/ingredients", json=INGREDIENTS)
+    client.post("/api/units", json=_volume_units())
+    client.post("/api/rules", json=RULES)
+
+    sauce_ml = {
+        "code": "SAUCE_ML", "version": "1",
+        "yield": {"qty": 1000, "unit": "ml"}, "servings": 10,
+        "components": [
+            {"kind": "ingredient", "code": "TOMATO", "qty": 600, "unit": "g"},
+        ],
+    }
+    meal_ml = {
+        "code": "VOLUME_MEAL", "version": "1",
+        "yield": {"qty": 2000, "unit": "ml"}, "servings": 4,
+        "components": [
+            {"kind": "recipe", "code": "SAUCE_ML", "version": "1",
+             "qty": 1000, "unit": "ml"},
+        ],
+    }
+    client.post("/api/recipes", json=sauce_ml)
+    client.post("/api/recipes", json=meal_ml)
+
+    resp = client.post("/api/computations", json={
+        "recipe_code": "VOLUME_MEAL", "ingredient_release": "ing-1",
+        "unit_version": "u-vol", "rule_version": "r-1"})
+    assert resp.status_code == 422
+    err = resp.get_json()["error"]
+    assert err["code"] == "UNIT_CONFLICT"
+    assert err["field"] == (
+        "components[0](recipe:SAUCE_ML@1)[0](ingredient:TOMATO@1).unit"
+    )
+    assert err["details"] == {"from_unit": "g", "to_unit": "ml",
+                              "reason": "no_path"}
+    assert client.get("/api/recipes/VOLUME_MEAL/1/history").get_json() == []
+    assert client.get("/api/recipes/SAUCE_ML/1/history").get_json() == []
+
+
+def test_volume_meal_nested_boundary_unit_unreachable(client):
+    # 子配方按质量 g 计产量，根 VOLUME_MEAL 按 ml，却以 ml 引用子配方：
+    # 跨配方边界 ml→g 不可换算（叶子尚未处理，照样必须 4xx）
+    client.post("/api/ingredients", json=INGREDIENTS)
+    client.post("/api/units", json=_volume_units())
+    client.post("/api/rules", json=RULES)
+    client.post("/api/recipes", json=SAUCE)  # SAUCE 产量 g
+    meal = {
+        "code": "VOLUME_MEAL", "version": "1",
+        "yield": {"qty": 1000, "unit": "ml"}, "servings": 4,
+        "components": [
+            {"kind": "recipe", "code": "SAUCE", "version": "1",
+             "qty": 500, "unit": "ml"},
+        ],
+    }
+    client.post("/api/recipes", json=meal)
+    resp = client.post("/api/computations", json={
+        "recipe_code": "VOLUME_MEAL", "ingredient_release": "ing-1",
+        "unit_version": "u-vol", "rule_version": "r-1"})
+    assert resp.status_code == 422
+    err = resp.get_json()["error"]
+    assert err["code"] == "UNIT_CONFLICT"
+    assert err["field"] == "components[0](recipe:SAUCE@1).unit"
+    assert err["details"]["reason"] == "no_path"
+    assert client.get("/api/recipes/VOLUME_MEAL/1/history").get_json() == []
+
+
 def test_unit_table_contradiction_rejected(client):
     bad = {"version": "u-bad", "conversions": [
         {"from_unit": "kg", "to_unit": "g", "factor": 1000},

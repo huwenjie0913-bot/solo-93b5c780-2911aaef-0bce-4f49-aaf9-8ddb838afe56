@@ -373,7 +373,6 @@ def compute():
             ],
             "ingredients_aggregate": agg["ingredients_aggregate"],
             "allergens": agg["allergens"],
-            "warnings": meta["warnings"],
         }
 
         cur = conn.execute(

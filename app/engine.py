@@ -93,7 +93,6 @@ def expand_tree(conn, unit_pack, ingredient_pack, root_code, root_version):
     leaves = []
     boundaries = []
     conversions_used = []
-    warnings = []
 
     def get_recipe(code, version):
         key = (code, version)
@@ -208,21 +207,16 @@ def expand_tree(conn, unit_pack, ingredient_pack, root_code, root_version):
                 contribution = {
                     n: v * factor_to_basis for n, v in ing["nutrition"].items()
                 }
-                # 占比口径：尽量换算到根配方产量单位
-                root_unit_qty = None
-                try:
-                    root_unit_qty, root_path = graph.convert(
-                        eff_qty, comp["unit"], root["yield_unit"], field + ".unit"
-                    )
-                    conversions_used.append(
-                        {"field": field, "from": comp["unit"],
-                         "to": root["yield_unit"], "path": root_path}
-                    )
-                except Exception as exc:  # 不可达不应影响营养计算，仅给警告
-                    warnings.append(
-                        f"{field}: 无法换算到根配方单位 {root['yield_unit']!r}，"
-                        f"该原料不参与占比（{exc.message if hasattr(exc, 'message') else exc}）"
-                    )
+                # 占比口径：出现量必须能换算到根配方产量单位。
+                # 可换算到营养基准但换算不到根单位（如质量 g → 体积 ml）时
+                # 属于单位冲突：硬失败，不写计算记录，也不产生 null 占比。
+                root_unit_qty, root_path = graph.convert(
+                    eff_qty, comp["unit"], root["yield_unit"], field + ".unit"
+                )
+                conversions_used.append(
+                    {"field": field, "from": comp["unit"],
+                     "to": root["yield_unit"], "path": root_path}
+                )
 
                 leaf = {
                     "kind": "ingredient",
@@ -255,7 +249,6 @@ def expand_tree(conn, unit_pack, ingredient_pack, root_code, root_version):
     meta = {
         "root": root,
         "conversions_used": _dedupe_conversions(conversions_used),
-        "warnings": warnings,
     }
     return tree, leaves, boundaries, closure_rows, meta
 
@@ -346,7 +339,7 @@ def aggregate(leaves, root, servings_override, rules, meta):
             }
         )
 
-    # 原料维度占比（换算到根产量单位；不可换算的原料比例为 null）
+    # 原料维度占比（出现量均已换算到根产量单位；换算不到的在展开期即 4xx）
     agg = {}
     agg_order = []
     for leaf in leaves:
@@ -357,17 +350,13 @@ def aggregate(leaves, root, servings_override, rules, meta):
                 "release_version": leaf["release_version"],
                 "name": leaf["name"],
                 "leaf_count": 0,
-                "root_unit_qty": 0.0 if leaf["root_unit_qty"] is not None else None,
+                "root_unit_qty": 0.0,
                 "unit": root["yield_unit"],
             }
             agg[leaf["code"]] = a
             agg_order.append(leaf["code"])
         a["leaf_count"] += 1
-        if leaf["root_unit_qty"] is not None:
-            if a["root_unit_qty"] is None:
-                a["root_unit_qty"] = leaf["root_unit_qty"]
-            else:
-                a["root_unit_qty"] += leaf["root_unit_qty"]
+        a["root_unit_qty"] += leaf["root_unit_qty"]
 
     ingredients_aggregate = []
     for code in agg_order:
@@ -376,10 +365,9 @@ def aggregate(leaves, root, servings_override, rules, meta):
         ingredients_aggregate.append(
             {
                 **a,
-                "root_unit_qty": round_half_up(qty, 4) if qty is not None else None,
+                "root_unit_qty": round_half_up(qty, 4),
                 "proportion_pct":
-                    round_half_up(qty / root["yield_qty"] * 100.0, 2)
-                    if qty is not None else None,
+                    round_half_up(qty / root["yield_qty"] * 100.0, 2),
             }
         )
 
@@ -492,7 +480,6 @@ def build_export(comp_id, fingerprint, cached, created_at, req,
         "leaves": leaves,
         "boundaries": boundaries,
         "conversion_paths_used": meta["conversions_used"],
-        "warnings": meta["warnings"],
         "totals_per_batch_raw": agg["totals"],
         "nutrition_per_serving": agg["nutrition_rows"],
         "ingredients_aggregate": agg["ingredients_aggregate"],
@@ -503,7 +490,8 @@ def build_export(comp_id, fingerprint, cached, created_at, req,
             "2) 营养贡献 = 出现量换算到基准单位后 ÷ 基准量 × 基准营养值；"
             "3) 每份营养 = 全部出现营养贡献之和 ÷ 份数（可被 servings_override 覆盖）；"
             "4) NRV% = 每份营养 ÷ 标签规则 daily_value × 100；"
-            "5) 原料占比 = 出现量换算到根配方产量单位之和 ÷ 根产量 × 100；"
+            "5) 原料占比 = 出现量换算到根配方产量单位之和 ÷ 根产量 × 100，"
+            "出现量无法换算到根产量单位（量纲不通）时整体按 UNIT_CONFLICT 失败；"
             "6) 过敏原按出现路径逐项上卷，contains 优先于 may_contain，free 不上标签。"
         ),
         "label_summary": summary_nutrition,
