@@ -12,6 +12,8 @@ from .common import content_hash
 
 VALID_ALLERGEN_STATUS = ("contains", "may_contain", "free")
 
+VALID_INGREDIENT_CATEGORIES = ("ingredient", "additive")
+
 
 # ---- 基础类型检查 -----------------------------------------------------------
 
@@ -92,10 +94,19 @@ def validate_ingredients(req):
                 )
             allergens[name] = status
 
+        category = ing.get("category", "ingredient")
+        if category not in VALID_INGREDIENT_CATEGORIES:
+            raise malformed(
+                f"category 必须是 {VALID_INGREDIENT_CATEGORIES} 之一"
+                "（ingredient=原料，additive=食品添加剂）",
+                f"{p}.category",
+            )
+
         norm.append(
             {
                 "code": code,
                 "name": ing.get("name", code),
+                "category": category,
                 "nutrition": nutrition,
                 "basis_amount": float(basis_amount),
                 "basis_unit": basis_unit,
@@ -169,6 +180,11 @@ DEFAULT_DV_DECIMALS = 0
 
 VALID_CLAIM_DIRECTIONS = ("lte", "gte")
 
+VALID_LABEL_MODES = ("parenthesize", "expand")
+
+DEFAULT_MINOR_THRESHOLD_PCT = 2.0
+DEFAULT_COMPOUND_THRESHOLD_PCT = 25.0
+
 
 def _validate_claims(req, required_names):
     """营养声明规则：声明名称、适用营养素、每份阈值、比较方向与单位。
@@ -233,6 +249,91 @@ def _validate_claims(req, required_names):
     return claims
 
 
+def _validate_code_list(raw, field):
+    """非空字符串数组：类型校验 + 同批次重复 → 400，返回规范化列表。"""
+    if not isinstance(raw, list) or not all(_is_nonempty_str(c) for c in raw):
+        raise malformed(f"{field} 必须是非空字符串数组", field)
+    codes = []
+    seen = set()
+    for c in raw:
+        if c in seen:
+            raise malformed(f"{field} 中编码 {c!r} 重复", field)
+        seen.add(c)
+        codes.append(c)
+    return codes
+
+
+def _validate_ingredient_list(req):
+    """配料表编排规则（全部可选，缺省时给出可复算的默认值）：
+
+      - mode：``parenthesize`` 复合配料保留括号结构（默认），
+        ``expand`` 完全展开到叶子原料；
+      - minor_threshold_pct：低于该成品占比（%）的辅料可省略；
+      - compound_threshold_pct：保留括号结构模式下，复合配料低于该占比时
+        折叠（GB 7718 风格），括号内仅保留强制展示的添加剂；
+      - mandatory_additives：无论占比多少都必须展示的添加剂编码；
+      - omit_eligible：可省略辅料白名单；给出时只有名单内编码才会因
+        低于阈值被省略（名单为空表示阈值对所有非强制项生效）。
+
+    规则互相矛盾（同一编码既强制展示又允许省略）→ 409 RULE_CONFLICT。
+    """
+    block = req.get("ingredient_list", {})
+    if block is None:
+        block = {}
+    if not isinstance(block, dict):
+        raise malformed("ingredient_list 必须是对象", "ingredient_list")
+
+    mode = block.get("mode", "parenthesize")
+    if mode not in VALID_LABEL_MODES:
+        raise malformed(
+            f"ingredient_list.mode 必须是 {VALID_LABEL_MODES} 之一",
+            "ingredient_list.mode",
+        )
+
+    def _pct(key, default):
+        if key not in block or block[key] is None:
+            return default
+        v = block[key]
+        if not _is_num(v) or v < 0 or v > 100:
+            raise malformed(
+                f"ingredient_list.{key} 必须是 0~100 之间的数字",
+                f"ingredient_list.{key}",
+            )
+        return float(v)
+
+    minor = _pct("minor_threshold_pct", DEFAULT_MINOR_THRESHOLD_PCT)
+    compound = _pct("compound_threshold_pct", DEFAULT_COMPOUND_THRESHOLD_PCT)
+
+    mandatory = _validate_code_list(
+        block.get("mandatory_additives", []),
+        "ingredient_list.mandatory_additives",
+    )
+    omit_eligible = _validate_code_list(
+        block.get("omit_eligible", []),
+        "ingredient_list.omit_eligible",
+    )
+
+    overlap = sorted(set(mandatory) & set(omit_eligible))
+    if overlap:
+        from .errors import rule_conflict
+
+        code = overlap[0]
+        raise rule_conflict(
+            f"配料规则冲突：编码 {code!r} 同时出现在 mandatory_additives（必须展示）"
+            "与 omit_eligible（低于阈值可省略）中，同一规则版本内不得互相矛盾",
+            "ingredient_list.mandatory_additives",
+            {"conflicting_codes": overlap, "code": code},
+        )
+
+    return {
+        "mode": mode,
+        "minor_threshold_pct": minor,
+        "compound_threshold_pct": compound,
+        "mandatory_additives": mandatory,
+        "omit_eligible": omit_eligible,
+    }
+
+
 def validate_rules(req):
     req = _require_body(req)
     version = _require(req, "version", "", "str")
@@ -274,11 +375,14 @@ def validate_rules(req):
     if not isinstance(dv_decimals, int) or isinstance(dv_decimals, bool) or dv_decimals < 0:
         raise malformed("dv_decimals 必须是非负整数", "dv_decimals")
 
+    ingredient_list = _validate_ingredient_list(req)
+
     body = {
         "required_nutrients": nutrients,
         "required_allergens": required_allergens,
         "claims": claims,
         "dv_decimals": dv_decimals,
+        "ingredient_list": ingredient_list,
     }
     return {"version": version, "body": body, "body_hash": content_hash(body)}
 

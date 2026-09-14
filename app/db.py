@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS ingredient (
     release_version   TEXT NOT NULL REFERENCES ingredient_release(release_version),
     code              TEXT NOT NULL,
     name              TEXT,
+    category          TEXT NOT NULL DEFAULT 'ingredient',
     nutrition         TEXT NOT NULL,   -- 营养素 -> 每 basis_amount/basis_unit 的数值
     basis_amount      REAL NOT NULL,
     basis_unit        TEXT NOT NULL,
@@ -124,6 +125,13 @@ def init_db(conn=None):
     own = conn is None
     conn = conn or get_conn()
     conn.executescript(SCHEMA)
+    # 旧库轻量迁移：ingredient.category（原料/添加剂）
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(ingredient)").fetchall()}
+    if "category" not in cols:
+        conn.execute(
+            "ALTER TABLE ingredient ADD COLUMN category TEXT NOT NULL"
+            " DEFAULT 'ingredient'"
+        )
     conn.commit()
     if own:
         conn.close()

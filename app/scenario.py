@@ -370,6 +370,69 @@ def allergens_diff(all_b, all_c):
 
 # ---- 响应组装 -----------------------------------------------------------------
 
+def _collect_label_codes(item, acc, prefix=""):
+    """收集配料表明细中的叶子编码及其处理状态（复合配料递归其展示项）。"""
+    if item.get("type") == "ingredient":
+        acc[item["code"]] = {
+            "name": item["name"], "status": item["status"],
+            "proportion_pct": item["proportion_pct"],
+        }
+        return
+    for sub in item.get("items", []):
+        _collect_label_codes(sub, acc, prefix)
+    for sub in item.get("omitted", []):
+        if sub.get("type") == "ingredient":
+            acc.setdefault(sub["code"], {
+                "name": sub["name"], "status": sub["status"],
+                "proportion_pct": sub["proportion_pct"]})
+
+
+def ingredient_list_diff(label_b, label_c):
+    """配料表编排差异：文本、状态变化（shown/forced/omitted）与占比变化。"""
+    if label_b is None or label_c is None:
+        return None
+    map_b, map_c = {}, {}
+    for it in label_b["items"]:
+        _collect_label_codes(it, map_b)
+    for it in label_b["omitted"]:
+        _collect_label_codes(it, map_b)
+    for it in label_c["items"]:
+        _collect_label_codes(it, map_c)
+    for it in label_c["omitted"]:
+        _collect_label_codes(it, map_c)
+
+    changes = []
+    for code in sorted(set(map_b) | set(map_c)):
+        b, c = map_b.get(code), map_c.get(code)
+        if b is None:
+            change = "added"
+        elif c is None:
+            change = "removed"
+        elif b["status"] != c["status"]:
+            change = f"{b['status']}_to_{c['status']}"
+        elif b["proportion_pct"] != c["proportion_pct"]:
+            change = "changed"
+        else:
+            change = "unchanged"
+        changes.append({
+            "code": code,
+            "name": (c or b)["name"],
+            "change": change,
+            "baseline_status": b["status"] if b else None,
+            "candidate_status": c["status"] if c else None,
+            "baseline_proportion_pct":
+                b["proportion_pct"] if b else None,
+            "candidate_proportion_pct":
+                c["proportion_pct"] if c else None,
+        })
+    return {
+        "baseline_text": label_b["text"],
+        "candidate_text": label_c["text"],
+        "text_changed": label_b["text"] != label_c["text"],
+        "items": changes,
+    }
+
+
 def _compact_rows(rows):
     return [
         {k: r[k] for k in ("nutrient", "per_serving", "pct_daily_value",
@@ -380,7 +443,7 @@ def _compact_rows(rows):
 
 def build_compare_response(req, ingredient_pack, unit_pack, rules_pack,
                            root, closure_b, fingerprint_b, effective,
-                           matched, agg_b, agg_c):
+                           matched, agg_b, agg_c, label_b=None, label_c=None):
     candidate_hash = content_hash({
         "baseline_fingerprint": fingerprint_b,
         "adjustments": effective,
@@ -416,11 +479,13 @@ def build_compare_response(req, ingredient_pack, unit_pack, rules_pack,
             "nutrition_per_serving": _compact_rows(agg_b["nutrition_rows"]),
             "ingredients_aggregate": agg_b["ingredients_aggregate"],
             "allergens": agg_b["allergens"],
+            "ingredient_list": label_b,
         },
         "candidate": {
             "nutrition_per_serving": _compact_rows(agg_c["nutrition_rows"]),
             "ingredients_aggregate": agg_c["ingredients_aggregate"],
             "allergens": agg_c["allergens"],
+            "ingredient_list": label_c,
         },
         "diff": {
             "nutrition": nutrition_diff(agg_b["nutrition_rows"],
@@ -428,5 +493,6 @@ def build_compare_response(req, ingredient_pack, unit_pack, rules_pack,
             "ingredients": ingredients_diff(agg_b["ingredients_aggregate"],
                                             agg_c["ingredients_aggregate"]),
             "allergens": allergens_diff(agg_b["allergens"], agg_c["allergens"]),
+            "ingredient_list": ingredient_list_diff(label_b, label_c),
         },
     }

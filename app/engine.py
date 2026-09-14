@@ -160,6 +160,7 @@ def expand_tree(conn, unit_pack, ingredient_pack, root_code, root_version,
             "code": code,
             "version": version,
             "name": recipe["name"],
+            "path": "components" + chain if chain else "components",
             "referenced_qty": ref_qty,
             "referenced_unit": ref_unit,
             "referenced_in_yield_unit": in_yield_qty,
@@ -231,6 +232,7 @@ def expand_tree(conn, unit_pack, ingredient_pack, root_code, root_version,
                     "code": ing["code"],
                     "release_version": ingredient_pack["version"],
                     "name": ing["name"],
+                    "category": ing["category"],
                     "path": field,
                     "depth": depth + 1,
                     "effective_qty": eff_qty,
@@ -497,6 +499,8 @@ def build_fingerprint(req, root_code, root_version, servings, closure_rows,
             "ingredient_release": ingredient_pack["version"],
             "unit_version": unit_pack["version"],
             "rule_version": rules_pack["version"],
+            "ingredient_list_rules": rules_pack["body"].get(
+                "ingredient_list", {}),
         },
         "locked": {
             "ingredient_release_hash": ingredient_pack["body_hash"],
@@ -515,7 +519,7 @@ def build_fingerprint(req, root_code, root_version, servings, closure_rows,
 def build_export(comp_id, fingerprint, cached, created_at, req,
                  ingredient_pack, unit_pack, rules_pack,
                  root_code, root_version, root, tree, leaves, boundaries,
-                 closure_rows, agg, meta):
+                 closure_rows, agg, meta, label_composition=None):
     summary_nutrition = [
         {
             "nutrient": r["nutrient"],
@@ -559,6 +563,7 @@ def build_export(comp_id, fingerprint, cached, created_at, req,
         "ingredients_aggregate": agg["ingredients_aggregate"],
         "allergens": agg["allergens"],
         "claims": agg["claims"],
+        "ingredient_list": label_composition,
         "label_rules_applied": rules_pack["body"],
         "calculation_basis": (
             "1) 每个原料出现量 = 配方声明用量 × 沿途各配方 (引用量/配方产量) 缩放系数连乘；"
@@ -570,7 +575,14 @@ def build_export(comp_id, fingerprint, cached, created_at, req,
             "6) 过敏原按出现路径逐项上卷，contains 优先于 may_contain，free 不上标签；"
             "7) 营养声明 = 按锁定规则版本 claims 逐条判定：每份实际值按规则位数舍入后"
             "与每份阈值比较，lte 要求 ≤ 阈值、gte 要求 ≥ 阈值，"
-            "判定依据见各声明的 basis。"
+            "判定依据见各声明的 basis；"
+            "8) 配料表编排（ingredient_list）= 各层叶子出现量换算到根产量单位后"
+            "递归计算成品占比，同一展示层级同码原料合并并保留全部来源路径后降序；"
+            "parenthesize 模式保留复合配料括号结构（低于复合展开阈值时折叠，"
+            "括号内仅留强制添加剂），expand 模式完全展开；低于辅料省略阈值的辅料"
+            "按规则省略，食品添加剂与 mandatory_additives 不受阈值限制，"
+            "省略复合配料时其强制添加剂上提父展示层级，逐项依据见 "
+            "ingredient_list.items/omitted 的 reason。"
         ),
         "label_summary": summary_nutrition,
     }

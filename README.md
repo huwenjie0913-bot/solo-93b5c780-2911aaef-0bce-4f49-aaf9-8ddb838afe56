@@ -5,7 +5,10 @@
 - **递归展开嵌套配方成分树**（配方可引用带版本号的子配方）；
 - 按根配方产量/份数推导**每份营养值与 NRV%**、**原料最终占比**；
 - 沿成分树**逐项保留过敏原来源路径**（`contains` 优先于 `may_contain`，`free` 不上标签）；
-- 对**循环引用、未知原料/配方、单位冲突、声明缺失**返回 4xx 并指出字段路径；
+- **配料表编排**：递归计算各层投料占比，复合配料可保留括号结构或完全展开，
+  同层同码原料合并后按占比降序并保留来源路径，低占比辅料按规则省略、
+  食品添加剂与强制名单项始终展示（省略复合配料时其上提父层级）；
+- 对**循环引用、未知原料/配方、单位冲突、声明缺失、规则冲突**返回 4xx 并指出字段路径；
 - **资料版本不可变 + 计算时版本锁定**，历史计算永远可复算；
 - 以**请求指纹**复用完全等价的计算；
 - 可**按配方追溯**其作为根配方或子配方参与过的全部计算；
@@ -21,7 +24,7 @@
 pip install -r requirements.txt
 export LABEL_DB_PATH=./labels.db     # 可选，默认 ./labels.db
 python run.py                        # http://localhost:5000
-pytest -q                            # 50 个端到端测试
+pytest -q                            # 69 个端到端测试
 ```
 
 ## 数据模型与版本语义
@@ -30,9 +33,9 @@ pytest -q                            # 50 个端到端测试
 
 | 实体 | 提交接口 | 关键内容 |
 |---|---|---|
-| 原料资料 release | `POST /api/ingredients` | 一个版本含多个原料；营养值按 `basis_amount/basis_unit` 声明；过敏原状态 `contains/may_contain/free` |
+| 原料资料 release | `POST /api/ingredients` | 一个版本含多个原料；营养值按 `basis_amount/basis_unit` 声明；过敏原状态 `contains/may_contain/free`；`category` 为 `ingredient`（默认）或 `additive`（食品添加剂，配料表中不受省略阈值限制） |
 | 单位换算表 | `POST /api/units` | `1 from_unit = factor to_unit`（自动加反向边，闭包一致性校验） |
-| 标签规则 | `POST /api/rules` | 必报营养素、NRV 每日参考值、舍入位数、必报过敏原、营养声明 `claims`（名称/营养素/每份阈值/方向/单位） |
+| 标签规则 | `POST /api/rules` | 必报营养素、NRV 每日参考值、舍入位数、必报过敏原、营养声明 `claims`（名称/营养素/每份阈值/方向/单位）、配料表编排 `ingredient_list`（括号/展开模式、省略阈值、复合展开阈值、强制添加剂、可省略白名单） |
 | 配方 | `POST /api/recipes` | 产量 `yield{qty,unit}`、份数、成分（原料或子配方引用，可指定版本） |
 
 - 相同版本 + 相同内容重复提交 → `200 replayed`（幂等）；
@@ -95,6 +98,83 @@ pytest -q                            # 50 个端到端测试
 `delta` = 实际值 − 阈值（同位数舍入），`basis` 为文字版判定依据。
 声明定义随规则体哈希进入请求指纹：换用阈值不同的规则版本会得到新的
 计算记录，历史记录始终按其锁定的规则版本复算。
+
+## 配料表编排（ingredient_list）
+
+规则版本可携带可选的 `ingredient_list` 块，定义标签配料表的编排口径。
+中央厨房的酱料/馅料子配方被成品反复嵌入时，引擎按锁定配方树递归计算
+**各层投料的成品占比**（叶子出现量沿配方边界连乘缩放、换算到根产量单位后
+÷ 根产量），再依规则生成可直接印刷的文本与结构化明细：
+
+```json
+"ingredient_list": {
+  "mode": "parenthesize",
+  "minor_threshold_pct": 2,
+  "compound_threshold_pct": 25,
+  "mandatory_additives": ["PRES"],
+  "omit_eligible": ["WATER", "SALT", "SUGAR"]
+}
+```
+
+| 字段 | 缺省 | 含义 |
+|---|---|---|
+| `mode` | `parenthesize` | `parenthesize` 复合配料保留括号结构 `肉馅（猪肉、酱油（大豆、食盐））`；`expand` 完全展开到叶子原料（跨层同码全部合并） |
+| `minor_threshold_pct` | `2` | 成品占比低于该阈值的辅料可省略（阈值判定用未舍入占比，显示保留 2 位） |
+| `compound_threshold_pct` | `25` | parenthesize 模式下复合配料低于该占比时折叠为括号简式，括号内**仅保留强制展示的添加剂** |
+| `mandatory_additives` | `[]` | 无论占比多少都必须展示的原料编码（强制名单） |
+| `omit_eligible` | `[]` | 可省略辅料白名单；给出时只有名单内编码才会因低于阈值被省略，空数组表示阈值对所有非强制项生效 |
+
+省略与强制规则：
+
+- 原料提交时可声明 `"category": "additive"`（食品添加剂，缺省 `ingredient`）。
+  **添加剂与 `mandatory_additives` 名单项不受省略阈值限制**，任何层级都展示；
+- 同一展示层级的同码原料（复合配料按同码同版）先**合并数量、保留全部来源路径**，
+  再按占比降序排列（并列保持配方树首次出现顺序）；
+- 复合配料成品占比低于 `minor_threshold_pct` 且其非保护成分都允许省略时，
+  整体省略；其强制添加剂**上提至父展示层级**（同码与父层出现合并、标记
+  `hoisted_from`），来源路径仍指向叶子出现；
+- 原料资料中存在但本配方树未出现的强制名单编码，结果以 `notes` 说明（不报错）。
+
+计算结果、`GET /api/computations/<id>` 与导出文档均含 `ingredient_list`：
+
+```json
+{"text": "配料表：小麦粉、肉馅（猪肉、白砂糖、酱油（谷氨酸钠、山梨酸钾））",
+ "mode": "parenthesize", "rule_version": "r-1",
+ "thresholds": {"minor_threshold_pct": 2, "compound_threshold_pct": 25},
+ "items": [
+   {"type": "ingredient", "code": "FLOUR", "name": "小麦粉",
+    "proportion_pct": 60.0, "within_parent_pct": 60.0,
+    "status": "shown", "sources": [{"path": "components[0](ingredient:FLOUR@1)", ...}],
+    "reason": "成品占比 60.0% ≥ 辅料省略阈值 2%，正常展示（规则版本 r-1）"},
+   {"type": "compound", "code": "FILLING", "version": "1", "name": "肉馅",
+    "proportion_pct": 40.0, "status": "shown", "expanded": true,
+    "items": [ /* 括号内条目，字段同形，另有 within_parent_pct */ ],
+    "forced_items": [ /* 括号内强制添加剂 */ ],
+    "omitted": [ /* 该层被省略条目（折叠简式中隐藏的成分也在此给出依据） */ ],
+    "reason": "...保留括号结构；括号内同码原料合并后按占比降序..."}],
+ "omitted": [ /* 顶层被省略条目；omitted_with_hoist 含 hoisted 上提清单 */ ],
+ "notes": [], "counts": {"displayed": 2, "shown": 1, "forced": 0, "omitted": 0},
+ "basis": "配料表按锁定标签规则 r-1 编排：1) ... 2) ...（逐项口径）"}
+```
+
+- `status`：`shown`（正常展示）/ `forced`（添加剂或强制名单，阈值豁免）/
+  `omitted`（省略）；复合配料另用 `collapsed`（折叠简式）、
+  `omitted_with_hoist`（整体省略且强制添加剂已上提）；
+- 每个条目都带 `reason` 文字依据（阈值、豁免、合并次数、上提来源、规则版本）。
+
+规则提交期校验（沿用统一 4xx 模型）：
+
+| HTTP | code | 触发场景 |
+|---|---|---|
+| 400 | `MALFORMED` | `mode` 非法（field `ingredient_list.mode`）、阈值不在 0~100（`ingredient_list.minor_threshold_pct` 等）、名单不是字符串数组、同一名单内编码重复 |
+| 400 | `MALFORMED` | 原料 `category` 不是 `ingredient/additive`（field `ingredients[i].category`） |
+| 409 | `RULE_CONFLICT` | 同一编码同时出现在 `mandatory_additives` 与 `omit_eligible` 中（field `ingredient_list.mandatory_additives`，details 给 `conflicting_codes`） |
+
+`ingredient_list` 规则体随规则版本哈希进入**请求指纹**：换模式、换阈值或换名单
+都会产生新的计算记录，历史记录按其锁定规则版本复算。配料表占比依赖单位换算，
+出现量无法换算到根产量单位时沿用 `UNIT_CONFLICT` 422（带字段路径），
+不产生空占比、不写计算记录。试算比较（`/api/scenarios/compare`）的基准/候选
+两侧也返回各自的 `ingredient_list`，`diff.ingredient_list` 给出文本与逐项状态变化。
 
 ## 快速示例
 
@@ -214,7 +294,7 @@ components[1](recipe:SAUCE@1)[0](ingredient:TOMATO@1)
 |---|---|---|
 | 400 | `MALFORMED` | JSON 非法、字段缺失/类型错误/非正数；声明营养素未在 `required_nutrients` 中、无效比较方向（field 定位 `claims[i].nutrient` / `claims[i].direction`） |
 | 404 | `NOT_FOUND` | 锁定版本（原料/单位/规则）或根配方不存在 |
-| 409 | `CONFLICT` / `UNIT_CONFLICT` / `CLAIM_CONFLICT` | 不可变版本被改内容重提；换算表因子自相矛盾；同名声明在同一规则版本中定义矛盾（阈值冲突，field 定位 `claims[i].threshold`） |
+| 409 | `CONFLICT` / `UNIT_CONFLICT` / `CLAIM_CONFLICT` / `RULE_CONFLICT` | 不可变版本被改内容重提；换算表因子自相矛盾；同名声明在同一规则版本中定义矛盾（阈值冲突，field 定位 `claims[i].threshold`）；配料规则中同一编码既强制展示又允许省略 |
 | 422 | `CIRCULAR_REFERENCE` | 配方树存在环（details 给出 cycle） |
 | 422 | `UNKNOWN_INGREDIENT` / `UNKNOWN_RECIPE` | 引用了锁定资料中不存在的原料/配方版本 |
 | 422 | `UNIT_CONFLICT` | 未知单位、引用单位无法换算到子配方产量单位、出现量无法换算到原料基准单位或根配方产量单位（如质量 g 与体积 ml 之间无换算） |
@@ -257,6 +337,8 @@ app/
   units.py       单位换算图 + 闭包一致性 + BFS 换算路径
   validation.py  载荷形状校验
   engine.py      递归展开、营养/占比/过敏原推导、营养声明判定、指纹、导出文档
+  labeling.py    配料表编排：各层占比、括号/展开模式、同码合并降序、省略阈值、
+                 强制添加剂上提、标签文本与逐项依据
   scenario.py    试算比较：按路径调整、基准/候选并排推导、差异汇总（不落库）
   api.py         Flask 路由
   app_factory.py 应用工厂与错误序列化

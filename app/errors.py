@@ -66,6 +66,12 @@ def claim_conflict(message, field, details=None):
     return APIError("CLAIM_CONFLICT", message, field, details, 409)
 
 
+def rule_conflict(message, field, details=None):
+    """同一标签规则版本内配料表编排规则互相矛盾（如同一编码既被强制展示
+    又被列入可省略名单）。"""
+    return APIError("RULE_CONFLICT", message, field, details, 409)
+
+
 def invalid_path(message, field, details=None):
     """试算调整路径失效：下标越界、注解与实际成分不符、无法下钻。"""
     return APIError("INVALID_PATH", message, field, details, 422)

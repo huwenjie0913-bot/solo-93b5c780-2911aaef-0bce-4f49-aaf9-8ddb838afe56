@@ -5,6 +5,7 @@ import json
 from flask import Blueprint, jsonify, request
 
 from . import engine
+from . import labeling
 from . import scenario
 from .db import get_conn, row_to_dict, utc_now_iso
 from .errors import APIError, conflict
@@ -70,9 +71,11 @@ def post_ingredients():
         )
         for ing in data["ingredients"]:
             conn.execute(
-                "INSERT INTO ingredient(release_version, code, name, nutrition,"
-                " basis_amount, basis_unit, allergens) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO ingredient(release_version, code, name, category,"
+                " nutrition, basis_amount, basis_unit, allergens)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (data["release_version"], ing["code"], ing["name"],
+                 ing["category"],
                  json.dumps(ing["nutrition"], ensure_ascii=False),
                  ing["basis_amount"], ing["basis_unit"],
                  json.dumps(ing["allergens"], ensure_ascii=False)),
@@ -324,6 +327,9 @@ def compute():
         agg = engine.aggregate(
             leaves, root, req["servings_override"], rules_pack, meta
         )
+        label_composition = labeling.compose_ingredient_list(
+            tree, root, rules_pack, ingredient_pack
+        )
         fingerprint, fp_payload = engine.build_fingerprint(
             req, req["recipe_code"], req["recipe_version"], agg["servings"],
             closure_rows, ingredient_pack, unit_pack, rules_pack,
@@ -376,6 +382,7 @@ def compute():
             "ingredients_aggregate": agg["ingredients_aggregate"],
             "allergens": agg["allergens"],
             "claims": agg["claims"],
+            "ingredient_list": label_composition,
         }
 
         cur = conn.execute(
@@ -390,7 +397,7 @@ def compute():
         export_doc = engine.build_export(
             comp_id, fingerprint, False, now, req, ingredient_pack, unit_pack,
             rules_pack, req["recipe_code"], req["recipe_version"], root, tree,
-            leaves, boundaries, closure_rows, agg, meta,
+            leaves, boundaries, closure_rows, agg, meta, label_composition,
         )
         conn.execute("UPDATE computation SET export_doc = ? WHERE id = ?",
                      (json.dumps(export_doc, ensure_ascii=False), comp_id))
@@ -474,13 +481,15 @@ def scenario_compare():
         rules_pack = engine.load_rules(conn, req["rule_version"])
 
         # 基准：与正式计算完全同口径（纯读取）
-        _, leaves_b, _, closure_b, meta_b = engine.expand_tree(
+        tree_b, leaves_b, _, closure_b, meta_b = engine.expand_tree(
             conn, unit_pack, ingredient_pack,
             req["recipe_code"], req["recipe_version"],
         )
         engine.check_declarations(leaves_b, rules_pack)
         agg_b = engine.aggregate(leaves_b, meta_b["root"],
                                  req["servings_override"], rules_pack, meta_b)
+        label_b = labeling.compose_ingredient_list(
+            tree_b, meta_b["root"], rules_pack, ingredient_pack)
         fingerprint_b, _ = engine.build_fingerprint(
             req, req["recipe_code"], req["recipe_version"], agg_b["servings"],
             closure_b, ingredient_pack, unit_pack, rules_pack,
@@ -494,7 +503,7 @@ def scenario_compare():
 
         # 候选：同口径展开 + 声明校验；失败归因到 adjustments[i]
         try:
-            _, leaves_c, _, _, meta_c = engine.expand_tree(
+            tree_c, leaves_c, _, _, meta_c = engine.expand_tree(
                 conn, unit_pack, ingredient_pack,
                 req["recipe_code"], req["recipe_version"],
                 recipe_overrides=overrides,
@@ -504,10 +513,13 @@ def scenario_compare():
             raise scenario.remap_error(err, matched) from err
         agg_c = engine.aggregate(leaves_c, meta_c["root"],
                                  req["servings_override"], rules_pack, meta_c)
+        label_c = labeling.compose_ingredient_list(
+            tree_c, meta_c["root"], rules_pack, ingredient_pack)
 
         return jsonify(scenario.build_compare_response(
             req, ingredient_pack, unit_pack, rules_pack, meta_b["root"],
             closure_b, fingerprint_b, effective, matched, agg_b, agg_c,
+            label_b, label_c,
         )), 200
     finally:
         conn.close()
