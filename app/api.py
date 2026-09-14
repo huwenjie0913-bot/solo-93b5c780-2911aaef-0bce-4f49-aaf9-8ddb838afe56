@@ -375,6 +375,7 @@ def compute():
             ],
             "ingredients_aggregate": agg["ingredients_aggregate"],
             "allergens": agg["allergens"],
+            "claims": agg["claims"],
         }
 
         cur = conn.execute(

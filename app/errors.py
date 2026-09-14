@@ -61,6 +61,11 @@ def missing_declaration(message, field, details=None):
     return APIError("MISSING_DECLARATION", message, field, details, 422)
 
 
+def claim_conflict(message, field, details=None):
+    """同一声明名称在同一规则版本中给出了矛盾的阈值/方向/营养素定义。"""
+    return APIError("CLAIM_CONFLICT", message, field, details, 409)
+
+
 def invalid_path(message, field, details=None):
     """试算调整路径失效：下标越界、注解与实际成分不符、无法下钻。"""
     return APIError("INVALID_PATH", message, field, details, 422)

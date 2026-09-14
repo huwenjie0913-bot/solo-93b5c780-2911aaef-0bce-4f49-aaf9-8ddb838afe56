@@ -21,7 +21,7 @@
 pip install -r requirements.txt
 export LABEL_DB_PATH=./labels.db     # 可选，默认 ./labels.db
 python run.py                        # http://localhost:5000
-pytest -q                            # 39 个端到端测试
+pytest -q                            # 50 个端到端测试
 ```
 
 ## 数据模型与版本语义
@@ -32,7 +32,7 @@ pytest -q                            # 39 个端到端测试
 |---|---|---|
 | 原料资料 release | `POST /api/ingredients` | 一个版本含多个原料；营养值按 `basis_amount/basis_unit` 声明；过敏原状态 `contains/may_contain/free` |
 | 单位换算表 | `POST /api/units` | `1 from_unit = factor to_unit`（自动加反向边，闭包一致性校验） |
-| 标签规则 | `POST /api/rules` | 必报营养素、NRV 每日参考值、舍入位数、必报过敏原 |
+| 标签规则 | `POST /api/rules` | 必报营养素、NRV 每日参考值、舍入位数、必报过敏原、营养声明 `claims`（名称/营养素/每份阈值/方向/单位） |
 | 配方 | `POST /api/recipes` | 产量 `yield{qty,unit}`、份数、成分（原料或子配方引用，可指定版本） |
 
 - 相同版本 + 相同内容重复提交 → `200 replayed`（幂等）；
@@ -50,10 +50,51 @@ pytest -q                            # 39 个端到端测试
 4. **原料占比** = 该原料所有出现量换算到根配方产量单位之和 ÷ 根产量；
    出现量若无法换算到根产量单位（量纲不通，如 `g` 与 `ml`）直接 422，
    不会产生空占比，也不会写入计算记录；
-5. **过敏原** = 每个非 `free` 声明保留一条来源（原料、状态、完整字段路径、出现量）。
+5. **过敏原** = 每个非 `free` 声明保留一条来源（原料、状态、完整字段路径、出现量）；
+6. **营养声明** = 按锁定规则版本的 `claims` 逐条判定：每份实际值按该营养素
+   规则位数舍入后与每份阈值比较，`lte` 要求 ≤ 阈值、`gte` 要求 ≥ 阈值。
 
 请求指纹 = SHA256(规范化 JSON{请求参数, 原料/单位/规则版本哈希, 展开闭包内各配方版本+内容哈希})，
 任一锁定资料或配方内容变化都会产生新指纹；同指纹直接复用历史记录并累计 `hits`。
+
+## 营养声明（claims）
+
+规则版本可携带可选的 `claims` 数组，定义低钠、高蛋白等自愿声明的判定口径：
+
+```json
+{"version": "r-1",
+ "required_nutrients": [
+   {"name": "protein", "daily_value": 50, "decimals": 1},
+   {"name": "sodium_mg", "daily_value": 2000, "decimals": 0}],
+ "claims": [
+   {"name": "low_sodium", "nutrient": "sodium_mg",
+    "threshold": 120, "direction": "lte", "unit": "mg"},
+   {"name": "high_protein", "nutrient": "protein",
+    "threshold": 25, "direction": "gte", "unit": "g"}]}
+```
+
+- `nutrient` 必须已在本版本 `required_nutrients` 中声明（判定依赖强制申报的
+  每份值），否则提交期 `400`，字段定位 `claims[i].nutrient`；
+- `direction` 仅接受 `lte`（不超过阈值）/ `gte`（不低于阈值），
+  其他取值 `400`，字段定位 `claims[i].direction`；
+- `threshold` 为非负数字（每份阈值），`unit` 为阈值/实际值的展示单位；
+- 同一版本内声明名称唯一：同名定义矛盾（如阈值不同）→ `409 CLAIM_CONFLICT`，
+  字段定位到冲突属性（如 `claims[1].threshold`）；完全重复 → `400`。
+
+计算时逐条判定并随结果返回（计算摘要、`GET /api/computations/<id>`、
+导出文档的 `claims` 字段均可见）：
+
+```json
+{"name": "low_sodium", "nutrient": "sodium_mg", "direction": "lte",
+ "threshold": 120, "unit": "mg", "actual": 10, "actual_raw": 9.6,
+ "delta": -110, "passed": true, "rule_version": "r-1",
+ "basis": "每份 sodium_mg 实际值 10 mg（未舍入 9.6，按规则保留 0 位）≤ 阈值 120 mg（规则版本 r-1） → 达标"}
+```
+
+`actual` 为按规则位数舍入后的每份值（与标签展示值一致，参与比较），
+`delta` = 实际值 − 阈值（同位数舍入），`basis` 为文字版判定依据。
+声明定义随规则体哈希进入请求指纹：换用阈值不同的规则版本会得到新的
+计算记录，历史记录始终按其锁定的规则版本复算。
 
 ## 快速示例
 
@@ -171,9 +212,9 @@ components[1](recipe:SAUCE@1)[0](ingredient:TOMATO@1)
 
 | HTTP | code | 触发场景 |
 |---|---|---|
-| 400 | `MALFORMED` | JSON 非法、字段缺失/类型错误/非正数 |
+| 400 | `MALFORMED` | JSON 非法、字段缺失/类型错误/非正数；声明营养素未在 `required_nutrients` 中、无效比较方向（field 定位 `claims[i].nutrient` / `claims[i].direction`） |
 | 404 | `NOT_FOUND` | 锁定版本（原料/单位/规则）或根配方不存在 |
-| 409 | `CONFLICT` / `UNIT_CONFLICT` | 不可变版本被改内容重提；换算表因子自相矛盾 |
+| 409 | `CONFLICT` / `UNIT_CONFLICT` / `CLAIM_CONFLICT` | 不可变版本被改内容重提；换算表因子自相矛盾；同名声明在同一规则版本中定义矛盾（阈值冲突，field 定位 `claims[i].threshold`） |
 | 422 | `CIRCULAR_REFERENCE` | 配方树存在环（details 给出 cycle） |
 | 422 | `UNKNOWN_INGREDIENT` / `UNKNOWN_RECIPE` | 引用了锁定资料中不存在的原料/配方版本 |
 | 422 | `UNIT_CONFLICT` | 未知单位、引用单位无法换算到子配方产量单位、出现量无法换算到原料基准单位或根配方产量单位（如质量 g 与体积 ml 之间无换算） |
@@ -205,7 +246,7 @@ GET    /health
 
 导出文档包含：锁定的四个版本号与 `body_hash`、展开闭包、完整成分树、
 每个叶子的基准换算量/根产量单位换算量与营养贡献、跨配方边界缩放记录、
-实际使用的单位换算路径以及文字版计算口径。
+实际使用的单位换算路径、营养声明逐条判定结果（`claims`）以及文字版计算口径。
 
 ## 目录结构
 
@@ -215,10 +256,10 @@ app/
   errors.py      统一 4xx 模型
   units.py       单位换算图 + 闭包一致性 + BFS 换算路径
   validation.py  载荷形状校验
-  engine.py      递归展开、营养/占比/过敏原推导、指纹、导出文档
+  engine.py      递归展开、营养/占比/过敏原推导、营养声明判定、指纹、导出文档
   scenario.py    试算比较：按路径调整、基准/候选并排推导、差异汇总（不落库）
   api.py         Flask 路由
   app_factory.py 应用工厂与错误序列化
-tests/test_api.py 16 个端到端测试
+tests/           test_api.py / test_scenarios.py / test_claims.py（50 个端到端测试）
 run.py
 ```

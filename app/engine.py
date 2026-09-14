@@ -322,6 +322,57 @@ def check_declarations(leaves, rules):
         )
 
 
+# ---- 营养声明判定（按锁定规则版本逐条比较每份值与阈值）------------------------
+
+def evaluate_claims(nutrition_rows, rules_pack):
+    """对规则版本中的每条营养声明给出判定结果。
+
+    比较口径：每份实际值先按该营养素在规则中的位数舍入（与标签展示值一致），
+    再与阈值比较；lte 要求 ≤ 阈值，gte 要求 ≥ 阈值。结果携带实际值、阈值、
+    单位、差值（实际 − 阈值，按同位数舍入）与文字版判定依据（含规则版本），
+    供审核人员核对声明是否达标、采用了哪一版法规阈值、相差多少。
+    """
+    claims = rules_pack["body"].get("claims", [])
+    if not claims:
+        return []
+    rows = {r["nutrient"]: r for r in nutrition_rows}
+    results = []
+    for c in claims:
+        # 规则校验已保证 nutrient ∈ required_nutrients，每份行必然存在
+        row = rows[c["nutrient"]]
+        actual = row["per_serving"]
+        threshold = c["threshold"]
+        if c["direction"] == "lte":
+            passed = actual <= threshold
+            op = "≤"
+        else:
+            passed = actual >= threshold
+            op = "≥"
+        delta = round_half_up(actual - threshold, row["decimals"])
+        if delta == 0:
+            delta += 0.0  # 去掉 -0.0
+        results.append({
+            "name": c["name"],
+            "nutrient": c["nutrient"],
+            "direction": c["direction"],
+            "threshold": threshold,
+            "unit": c["unit"],
+            "actual": actual,
+            "actual_raw": row["per_serving_raw"],
+            "delta": delta,
+            "passed": passed,
+            "rule_version": rules_pack["version"],
+            "basis": (
+                f"每份 {c['nutrient']} 实际值 {actual} {c['unit']}"
+                f"（未舍入 {row['per_serving_raw']}，按规则保留 "
+                f"{row['decimals']} 位）{op} 阈值 {threshold} {c['unit']}"
+                f"（规则版本 {rules_pack['version']}）"
+                f" → {'达标' if passed else '不达标'}"
+            ),
+        })
+    return results
+
+
 # ---- 汇总、份量与占比 -------------------------------------------------------
 
 def aggregate(leaves, root, servings_override, rules, meta):
@@ -429,6 +480,7 @@ def aggregate(leaves, root, servings_override, rules, meta):
         "nutrition_rows": nutrition_rows,
         "ingredients_aggregate": ingredients_aggregate,
         "allergens": allergens,
+        "claims": evaluate_claims(nutrition_rows, rules),
     }
 
 
@@ -506,6 +558,7 @@ def build_export(comp_id, fingerprint, cached, created_at, req,
         "nutrition_per_serving": agg["nutrition_rows"],
         "ingredients_aggregate": agg["ingredients_aggregate"],
         "allergens": agg["allergens"],
+        "claims": agg["claims"],
         "label_rules_applied": rules_pack["body"],
         "calculation_basis": (
             "1) 每个原料出现量 = 配方声明用量 × 沿途各配方 (引用量/配方产量) 缩放系数连乘；"
@@ -514,7 +567,10 @@ def build_export(comp_id, fingerprint, cached, created_at, req,
             "4) NRV% = 每份营养 ÷ 标签规则 daily_value × 100；"
             "5) 原料占比 = 出现量换算到根配方产量单位之和 ÷ 根产量 × 100，"
             "出现量无法换算到根产量单位（量纲不通）时整体按 UNIT_CONFLICT 失败；"
-            "6) 过敏原按出现路径逐项上卷，contains 优先于 may_contain，free 不上标签。"
+            "6) 过敏原按出现路径逐项上卷，contains 优先于 may_contain，free 不上标签；"
+            "7) 营养声明 = 按锁定规则版本 claims 逐条判定：每份实际值按规则位数舍入后"
+            "与每份阈值比较，lte 要求 ≤ 阈值、gte 要求 ≥ 阈值，"
+            "判定依据见各声明的 basis。"
         ),
         "label_summary": summary_nutrition,
     }

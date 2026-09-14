@@ -7,7 +7,7 @@
 import numbers
 import re
 
-from .errors import malformed
+from .errors import claim_conflict, malformed
 from .common import content_hash
 
 VALID_ALLERGEN_STATUS = ("contains", "may_contain", "free")
@@ -167,6 +167,71 @@ def validate_units(req):
 DEFAULT_NUTRIENT_DECIMALS = 1
 DEFAULT_DV_DECIMALS = 0
 
+VALID_CLAIM_DIRECTIONS = ("lte", "gte")
+
+
+def _validate_claims(req, required_names):
+    """营养声明规则：声明名称、适用营养素、每份阈值、比较方向与单位。
+
+    声明的判定依赖每份营养值，因此适用营养素必须已在本版本的
+    required_nutrients 中声明（缺失营养素 → 400）；direction 仅接受
+    lte/gte（无效方向 → 400）；同名声明定义矛盾（阈值冲突等 → 409）。
+    """
+    claims_in = req.get("claims", [])
+    if not isinstance(claims_in, list):
+        raise malformed("claims 必须是数组", "claims")
+
+    claims = []
+    seen = {}
+    for i, c in enumerate(claims_in):
+        p = f"claims[{i}]"
+        if not isinstance(c, dict):
+            raise malformed("声明规则必须是对象", p)
+        name = _require(c, "name", p, "str")
+        nutrient = _require(c, "nutrient", p, "str")
+        threshold = _require(c, "threshold", p, "num")
+        if threshold < 0:
+            raise malformed("threshold 必须是非负数字", f"{p}.threshold")
+        direction = _require(c, "direction", p, "str")
+        if direction not in VALID_CLAIM_DIRECTIONS:
+            raise malformed(
+                f"direction 必须是 {VALID_CLAIM_DIRECTIONS} 之一"
+                "（lte=不超过阈值，gte=不低于阈值）",
+                f"{p}.direction",
+            )
+        unit = _require(c, "unit", p, "str")
+        if nutrient not in required_names:
+            raise malformed(
+                f"声明引用的营养素 {nutrient!r} 未在本版本的 "
+                "required_nutrients 中声明，无法按每份值判定",
+                f"{p}.nutrient",
+                {"nutrient": nutrient,
+                 "required_nutrients": sorted(required_names)},
+            )
+        claim = {
+            "name": name,
+            "nutrient": nutrient,
+            "threshold": float(threshold),
+            "direction": direction,
+            "unit": unit,
+        }
+        if name in seen:
+            prev = seen[name]
+            if prev != claim:
+                for attr in ("threshold", "nutrient", "direction", "unit"):
+                    if prev[attr] != claim[attr]:
+                        raise claim_conflict(
+                            f"声明 {name!r} 在同一规则版本中存在冲突定义："
+                            f"{attr} 既为 {prev[attr]!r} 又为 {claim[attr]!r}",
+                            f"{p}.{attr}",
+                            {"claim": name, "attribute": attr,
+                             "existing": prev[attr], "new": claim[attr]},
+                        )
+            raise malformed(f"声明 {name!r} 在同一规则版本中重复", f"{p}.name")
+        seen[name] = claim
+        claims.append(claim)
+    return claims
+
 
 def validate_rules(req):
     req = _require_body(req)
@@ -203,6 +268,8 @@ def validate_rules(req):
     ):
         raise malformed("required_allergens 必须是字符串数组", "required_allergens")
 
+    claims = _validate_claims(req, seen)
+
     dv_decimals = req.get("dv_decimals", DEFAULT_DV_DECIMALS)
     if not isinstance(dv_decimals, int) or isinstance(dv_decimals, bool) or dv_decimals < 0:
         raise malformed("dv_decimals 必须是非负整数", "dv_decimals")
@@ -210,6 +277,7 @@ def validate_rules(req):
     body = {
         "required_nutrients": nutrients,
         "required_allergens": required_allergens,
+        "claims": claims,
         "dv_decimals": dv_decimals,
     }
     return {"version": version, "body": body, "body_hash": content_hash(body)}
